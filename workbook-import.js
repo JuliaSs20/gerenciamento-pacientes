@@ -21,8 +21,8 @@ function clearWorkbookImports(){
 }
 async function loadWorkbookImports(){
   if(!currentUser){clearWorkbookImports();return}
-  const {data,error}=await sb.from('workbook_imports').select('id,source_filename,file_sha256,sheets_meta,expected_rows,imported_rows,import_status,created_at').order('created_at',{ascending:false});
-  if(error){workbookStatus('Para importar, aplique a migration 202611220002_workbook_imports.sql no Supabase. ('+error.message+')',true);return}
+  const {data,error}=await sb.from('workbook_imports').select('id,source_filename,file_sha256,sheets_meta,expected_rows,imported_rows,import_status,integration_status,integration_counts,created_at').order('created_at',{ascending:false});
+  if(error){workbookStatus('Para habilitar a importação estruturada, execute as migrations 202611220002_workbook_imports.sql e 202611220003_financial_records.sql no Supabase. ('+error.message+')',true);return}
   workbookBatches=data||[];
   workbookBatchPicker.innerHTML='<option value="">Selecione uma planilha importada</option>'+workbookBatches.map(b=>'<option value="'+escapeHtml(b.id)+'">'+escapeHtml(b.source_filename)+' · '+escapeHtml(new Date(b.created_at).toLocaleString('pt-BR'))+'</option>').join('');
   if(workbookBatches.length){workbookBatchPicker.value=workbookBatches[0].id;await selectWorkbookBatch(workbookBatches[0].id)}
@@ -34,7 +34,8 @@ async function selectWorkbookBatch(id){
   if(!selectedWorkbookBatch){document.getElementById('workbookGridSummary').textContent='';return}
   const meta=Array.isArray(selectedWorkbookBatch.sheets_meta)?selectedWorkbookBatch.sheets_meta:[];
   workbookSheetPicker.innerHTML=meta.map(s=>'<option value="'+escapeHtml(s.name)+'">'+escapeHtml(s.name)+' · '+Number(s.rows||0)+' linhas</option>').join('');
-  document.getElementById('workbookGridSummary').textContent=selectedWorkbookBatch.import_status==='complete'?'Importação concluída · '+selectedWorkbookBatch.imported_rows+' linhas guardadas com segurança.':`Importação ${selectedWorkbookBatch.import_status==='processing'?'em andamento':'incompleta'} · ${selectedWorkbookBatch.imported_rows} de ${selectedWorkbookBatch.expected_rows} linhas.`;
+  const integrated=selectedWorkbookBatch.integration_status==='complete'?'Dados também integrados às telas de pacientes e financeiro.':selectedWorkbookBatch.import_status==='complete'?'Arquivo guardado; selecione novamente o Excel para integrar pacientes e lançamentos.':'Aguardando a conclusão da importação.';
+  document.getElementById('workbookGridSummary').textContent=(selectedWorkbookBatch.import_status==='complete'?'Importação concluída · '+selectedWorkbookBatch.imported_rows+' linhas guardadas com segurança.':`Importação ${selectedWorkbookBatch.import_status==='processing'?'em andamento':'incompleta'} · ${selectedWorkbookBatch.imported_rows} de ${selectedWorkbookBatch.expected_rows} linhas.`)+' '+integrated;
   await loadWorkbookSheet();
 }
 async function loadWorkbookSheet(){
@@ -100,15 +101,21 @@ async function importWorkbookFile(file){
   workbookImportButton.disabled=true;workbookStatus('Lendo as abas e preparando os registros no navegador…');
   try{
     const buffer=await file.arrayBuffer(),digest=bytesToHex(await crypto.subtle.digest('SHA-256',buffer));
-    const {data:existing,error:lookupError}=await sb.from('workbook_imports').select('id,import_status').eq('file_sha256',digest).maybeSingle();
+    const {data:existing,error:lookupError}=await sb.from('workbook_imports').select('id,import_status,integration_status,integration_counts').eq('file_sha256',digest).maybeSingle();
     if(lookupError)throw lookupError;
-    if(existing?.import_status==='complete'){
-      workbookStatus('Esta versão da planilha já foi importada.');
-      await loadWorkbookImports();workbookBatchPicker.value=existing.id;await selectWorkbookBatch(existing.id);return;
-    }
     const workbook=XLSX.read(buffer,{type:'array',cellFormula:true,cellNF:true,cellStyles:true,cellDates:false,bookVBA:false});
     const parsed=parseWorkbookFile(workbook),expectedRows=parsed.records.length;
     if(!expectedRows)throw new Error('Não encontrei linhas preenchidas no arquivo.');
+    if(existing?.import_status==='complete'){
+      if(existing.integration_status==='complete'){
+        workbookStatus('Esta versão já foi importada e integrada.');
+        await loadWorkbookImports();workbookBatchPicker.value=existing.id;await selectWorkbookBatch(existing.id);return;
+      }
+      workbookStatus('Planilha já arquivada. Integrando os dados às telas do site…');
+      const counts=await integrateStructuredWorkbook(workbook,existing.id);
+      workbookStatus('Integração concluída: '+counts.patients_created+' pacientes novos e '+counts.financial_records+' registros financeiros.');
+      await loadWorkbookImports();workbookBatchPicker.value=existing.id;await selectWorkbookBatch(existing.id);return;
+    }
     let batchId=existing?.id;
     if(!batchId){const {data,error}=await sb.from('workbook_imports').insert({owner_id:currentUser.id,source_filename:file.name,file_sha256:digest,sheets_meta:parsed.metadata,workbook_meta:{defined_names:parsed.names,properties:parsed.properties,parser:'SheetJS',macros_executed:false},expected_rows:expectedRows,imported_rows:0,import_status:'processing'}).select('id').single();if(error)throw error;batchId=data.id}
     for(let start=0;start<parsed.records.length;start+=25){
@@ -122,11 +129,14 @@ async function importWorkbookFile(file){
     }
     const {error:finishError}=await sb.from('workbook_imports').update({import_status:'complete',imported_rows:expectedRows,sheets_meta:parsed.metadata,workbook_meta:{defined_names:parsed.names,properties:parsed.properties,parser:'SheetJS',macros_executed:false}}).eq('id',batchId);
     if(finishError)throw finishError;
-    workbookStatus('Planilha importada: '+parsed.metadata.length+' abas e '+expectedRows+' linhas. Os dados agora estão vinculados à sua conta.');
+    workbookStatus('Arquivo guardado. Integrando pacientes e lançamentos às telas do site…');
+    const counts=await integrateStructuredWorkbook(workbook,batchId);
+    workbookStatus('Tudo concluído: '+parsed.metadata.length+' abas arquivadas, '+counts.patients_created+' pacientes novos e '+counts.financial_records+' registros financeiros integrados.');
     await loadWorkbookImports();workbookBatchPicker.value=batchId;await selectWorkbookBatch(batchId);
   }catch(error){
     const message=error?.message||'erro desconhecido';
-    if(/workbook_imports|workbook_import_rows|schema cache|does not exist/i.test(message))workbookStatus('A estrutura ainda não está pronta. Execute a migration 202611220002_workbook_imports.sql no SQL Editor do Supabase e tente novamente.',true);
+    if(/financial_records|integration_status|patients_status_check|patients_modality_check|patients_frequency_check|schema cache|does not exist/i.test(message))workbookStatus('Falta atualizar a estrutura de integração no Supabase. Execute a migration 202611220003_financial_records.sql no SQL Editor e tente novamente.',true);
+    else if(/workbook_imports|workbook_import_rows/i.test(message))workbookStatus('A estrutura de arquivo da planilha ainda não está pronta. Execute a migration 202611220002_workbook_imports.sql no Supabase e tente novamente.',true);
     else workbookStatus('A importação foi interrompida: '+message+'. Registros já enviados permanecem marcados como incompletos e podem ser retomados.',true);
   }finally{workbookImportButton.disabled=false}
 }

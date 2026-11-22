@@ -32,14 +32,17 @@ drop policy if exists "patients_select_own" on public.patients;
 create policy "patients_select_own" on public.patients
   for select to authenticated using (owner_id = (select auth.uid()));
 
-drop policy if exists "patients_insert_own" on public.patients;
-create policy "patients_insert_own" on public.patients
-  for insert to authenticated with check (owner_id = (select auth.uid()));
+create index if not exists patients_owner_name_idx on public.patients (owner_id, full_name);
+create index if not exists patients_owner_status_idx on public.patients (owner_id, status);
 
-drop policy if exists "patients_update_own" on public.patients;
-create policy "patients_update_own" on public.patients
-  for update to authenticated
-  using (owner_id = (select auth.uid()))
-  with check (owner_id = (select auth.uid()));
+alter table public.patients enable row level security;
+alter table public.patients force row level security;
+
+revoke all on public.patients from anon, authenticated;
+grant select, insert, update on public.patients to authenticated;
+
+drop policy if exists "patients_select_own" on public.patients;
+create policy "patients_select_own" on public.patients
+  for select to authenticated using (owner_id = (select auth.uid()));
 
 -- Sem política de exclusão: registros são preservados nesta fase inicial.
